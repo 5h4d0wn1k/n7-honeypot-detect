@@ -7,9 +7,11 @@ Detect honeypots via network fingerprinting, banner analysis, and behavior probi
 import socket
 import time
 import random
+import os
 import sys
 import argparse
 import struct
+import threading
 from collections import defaultdict
 
 
@@ -303,18 +305,135 @@ class HoneypotDetector:
         return honeypots_found
 
 
+class FakeHoneypotServer:
+    """Minimal TCP server that answers with a known honeypot banner.
+
+    Used only inside ``--harness`` (offline, localhost).
+    """
+
+    def __init__(self, banner=b'SSH-2.0-OpenSSH_6.6.1p1 Ubuntu-2ubuntu2.10',
+                 host='127.0.0.1'):
+        self.banner = banner
+        self.host = host
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind((self.host, 0))          # OS picks a free port
+        self.port = self.server.getsockname()[1]
+        self.server.listen(5)
+        self.server.settimeout(5)
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._accept_loop,
+                                        daemon=True)
+        self._thread.start()
+
+    def _accept_loop(self):
+        while True:
+            try:
+                client, _ = self.server.accept()
+                client.sendall(self.banner + b'\r\n')
+                client.close()
+            except socket.timeout:
+                break
+            except OSError:
+                break
+
+    def stop(self):
+        try:
+            self.server.close()
+        except OSError:
+            pass
+
+
+def run_harness():
+    """Spin up fake honeypot servers on localhost, scan them, verify detection.
+
+    Everything runs unprivileged via plain TCP connect scans. No raw sockets,
+    no root, no network access.
+    """
+    print('=== N7 Honeypot Detect: offline harness ===')
+
+    # 1. Start two fake honeypots on random free ports
+    hp1 = FakeHoneypotServer(banner=b'SSH-2.0-OpenSSH_6.6.1p1 Ubuntu-2ubuntu2.10')
+    hp2 = FakeHoneypotServer(banner=b'SSH-2.0-OpenSSH_5.9p1')
+    hp1.start()
+    hp2.start()
+    time.sleep(0.15)   # let threads enter accept()
+
+    ports = [hp1.port, hp2.port]
+    print(f'  Fake honeypots listening on ports {ports}')
+
+    # 2. Scan those two ports — should flag both
+    detector = HoneypotDetector(timeout=1)
+    r = detector.full_analysis('127.0.0.1', ports)
+    hp1.stop()
+    hp2.stop()
+
+    ok = True
+
+    def verify(label, cond, detail=''):
+        nonlocal ok
+        print(f'  [{"PASS" if cond else "FAIL"}] {label} {detail}')
+        ok = ok and cond
+
+    verify('port scan finds both ports',
+           r['open_ports'] == sorted(ports),
+           f'{r["open_ports"]}')
+    verify('verdict is HONEYPOT or SUSPICIOUS',
+           r['verdict'] in ('LIKELY HONEYPOT', 'SUSPICIOUS'),
+           f'{r["verdict"]} (score {r["score"]})')
+    verify('at least one known honeypot signature detected',
+           any('known_honeypot_sig' in ind
+               for ind in r['indicators']),
+           f'{r["indicators"]}')
+
+    # 3. Scan a closed port — should return CLEAN
+    unused = hp1.port  # already closed after stop()
+    r2 = detector.full_analysis('127.0.0.1', [unused])
+    verify('closed port yields CLEAN or LIKELY LEGITIMATE',
+           r2['verdict'] in ('CLEAN', 'LIKELY LEGITIMATE'),
+           f'{r2["verdict"]}')
+
+    # 4. Analyze banner strings directly
+    det = HoneypotDetector(timeout=1)
+    a1 = det.analyze_banner('SSH-2.0-OpenSSH_6.6.1p1 Ubuntu-2ubuntu2.10')
+    verify('banner analysis detects cowrie/OpenSSH_6.6',
+           a1['suspicious'] is True)
+    a2 = det.analyze_banner('Apache/2.4.57')
+    verify('banner analysis clears non-honeypot',
+           a2['suspicious'] is False)
+
+    print('\n[RESULT] ' + ('PASS' if ok else 'FAIL'))
+    return 0 if ok else 1
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='N7 — Honeypot Detector')
+        description='N7 — Honeypot Detector (offline harness + gated live)')
     parser.add_argument('target', nargs='?', help='Target IP')
     parser.add_argument('--ports', help='Comma-separated ports')
     parser.add_argument('--timeout', type=float, default=2,
                         help='Socket timeout')
+    parser.add_argument('--harness', action='store_true',
+                        help='Run offline harness with fake local honeypots '
+                             '(default when no args)')
+    parser.add_argument('--live', action='store_true',
+                        help='Allow live scans that need root (TTL/ICMP)')
     parser.add_argument('--scan-range', help='IP prefix to scan (e.g. 192.168.1)')
     parser.add_argument('--range-start', type=int, default=1)
     parser.add_argument('--range-end', type=int, default=10)
 
     args = parser.parse_args()
+
+    if args.harness or (not args.target and not args.scan_range):
+        sys.exit(run_harness())
+
+    if not os.geteuid() == 0 and (args.scan_range or args.live):
+        print('[-] Live mode / scan-range requires root; '
+              'rerun with sudo or use --harness for offline testing.')
+        sys.exit(1)
+
     detector = HoneypotDetector(args.timeout)
 
     print("╔═══════════════════════════════════════╗")
@@ -328,14 +447,7 @@ def main():
         if args.ports:
             ports = [int(p.strip()) for p in args.ports.split(',')]
         detector.full_analysis(args.target, ports)
-    else:
-        target = input("Target IP: ").strip()
-        ports_str = input("Ports (comma-sep or blank for default): ").strip()
-        ports = None
-        if ports_str:
-            ports = [int(p.strip()) for p in ports_str.split(',')]
-        detector.full_analysis(target, ports)
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

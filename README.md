@@ -26,46 +26,57 @@ No external dependencies — uses only the Python standard library.
 ## Usage
 
 ```bash
-# Analyze single target
-python3 honeypot_detect.py 192.168.1.100
+# Offline harness (default): spin up fake honeypots on localhost, verify detection
+python3 honeypot_detect.py --harness
+
+# Analyze a single target on a lab host (placeholders: RFC 5737 TEST-NET)
+python3 honeypot_detect.py 192.0.2.100
 
 # Analyze with custom ports
-python3 honeypot_detect.py 192.168.1.100 --ports 22,80,443
+python3 honeypot_detect.py 192.0.2.100 --ports 22,80,443
 
-# Scan IP range
-python3 honeypot_detect.py --scan-range 192.168.1 --range-start 1 --range-end 20
+# Scan an IP range on a lab network (needs --live for TTL analysis/root)
+python3 honeypot_detect.py --scan-range 192.0.2 --range-start 1 --range-end 20
 ```
 
-## Example Output
+The default (no args / `--harness`) runs a fully unprivileged offline harness:
+it starts real honeypot-style TCP servers on localhost, scans them, and asserts
+the banners and verdicts are flagged. TTL analysis (raw ICMP sockets) and live
+scan-range probing are gated: they require `--live` (root).
 
-```
-╔═══════════════════════════════════════╗
-║     N7 — Honeypot Detector            ║
-╚═══════════════════════════════════════╝
+## Live Lab Test Plan
 
-==================================================
-  Honeypot Analysis: 192.168.1.100
-==================================================
+> Authorized own-lab use only. Use documented placeholders (192.0.2.x, 198.51.100.x).
 
-[1/4] Port scanning...
-  Open ports: [22, 80, 8080]
+1. **Prepare a lab host** (VM/container) running a low-interaction honeypot
+   (e.g. `cowrie` or `kippo`) bound to a `192.0.2.x` address.
+2. Stand up a **clean** service host running a real `sshd`/nginx on the same
+   network for comparison.
+3. Run `python3 honeypot_detect.py 192.0.2.100` against the honeypot; confirm
+   the known-signature banner is flagged and the verdict is
+   `LIKELY HONEYPOT` or `SUSPICIOUS`.
+4. Run the same command against the clean host; confirm it is rated
+   `LIKELY LEGITIMATE`.
+5. With root, run `--live` to add TTL/ICMP analysis and confirm no false
+   positives on the clean host.
 
-[2/4] Banner grabbing...
-  [!] Port 22: HONEYPOT SIGNATURE (cowrie)
-      Banner: SSH-2.0-OpenSSH_6.6.1p1 Ubuntu-2ubuntu2
+## Metrics
 
-[3/4] TTL analysis...
-  TTL: 64 (OS: Linux/FreeBSD)
+Deterministic, unprivileged, offline/localhost:
 
-[4/4] Behavior probing...
-  Port 22: ['slow_response']
+- `python3 -m unittest discover -s tests` — 11 unit tests (exit 0)
+- Offline harness spins 2 fake honeypot servers, scans them, asserts:
+  - both honeypot ports found
+  - verdict is `LIKELY HONEYPOT` / `SUSPICIOUS`
+  - at least one known honeypot signature detected
+- Banner analysis: known SIGs (Cowrie/Kippo/Dionaea) flagged; legitimate
+  banner (Apache) cleared
+- Closed-port scan yields `CLEAN` — no false positive
+- Harness exit code: `0` on success, `1` on failure
 
-==================================================
-  VERDICT: LIKELY HONEYPOT (score: 6)
-==================================================
-```
+## License
 
-## Legal Disclaimer
+MIT
 
 **IMPORTANT: Read before use.**
 
