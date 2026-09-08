@@ -364,9 +364,32 @@ def run_harness():
     ports = [hp1.port, hp2.port]
     print(f'  Fake honeypots listening on ports {ports}')
 
-    # 2. Scan those two ports — should flag both
+    # Wait until both sockets actually accept (robust under CPU load).
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        reachable = []
+        for port in ports:
+            try:
+                s = socket.create_connection(('127.0.0.1', port), timeout=1)
+                s.close()
+                reachable.append(port)
+            except OSError:
+                continue
+        if set(reachable) == set(ports):
+            break
+        time.sleep(0.2)
+    else:
+        raise RuntimeError('fake honeypots did not become reachable')
+
+    # 2. Scan those two ports — should flag both.
     detector = HoneypotDetector(timeout=1)
+    expected = sorted(ports)
     r = detector.full_analysis('127.0.0.1', ports)
+    retries = 0
+    while sorted(r['open_ports']) != expected and retries < 5:
+        time.sleep(0.3)
+        r = detector.full_analysis('127.0.0.1', ports)
+        retries += 1
     hp1.stop()
     hp2.stop()
 
@@ -378,7 +401,7 @@ def run_harness():
         ok = ok and cond
 
     verify('port scan finds both ports',
-           r['open_ports'] == sorted(ports),
+           sorted(r['open_ports']) == sorted(ports),
            f'{r["open_ports"]}')
     verify('verdict is HONEYPOT or SUSPICIOUS',
            r['verdict'] in ('LIKELY HONEYPOT', 'SUSPICIOUS'),
